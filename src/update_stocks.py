@@ -67,22 +67,69 @@ HEADERS = {
 # =========================
 # HTTP
 # =========================
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))
+RETRY_SLEEP_SECONDS = float(os.getenv("HTTP_RETRY_SLEEP_SECONDS", "2"))
+
+
+def _request_with_retry(method, url, **kwargs):
+    last_exception = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+
+            if resp.status_code in RETRY_STATUS_CODES:
+                print(
+                    f"[HTTP RETRY] {method} {url} -> {resp.status_code}, "
+                    f"attempt {attempt}/{MAX_RETRIES}"
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_SLEEP_SECONDS * attempt)
+                    continue
+
+            resp.raise_for_status()
+            return resp
+
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+            print(
+                f"[HTTP ERROR] {method} {url}, "
+                f"attempt {attempt}/{MAX_RETRIES}: {e}"
+            )
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_SLEEP_SECONDS * attempt)
+                continue
+            raise
+
+    if last_exception:
+        raise last_exception
+
+    raise RuntimeError(f"HTTP request failed: {method} {url}")
+
+
 def http_get(url, headers=None, timeout=120):
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+    return _request_with_retry("GET", url, headers=headers, timeout=timeout)
 
 
 def http_post(url, json_payload=None, headers=None, timeout=120):
-    resp = requests.post(url, json=json_payload, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+    return _request_with_retry(
+        "POST",
+        url,
+        json=json_payload,
+        headers=headers,
+        timeout=timeout,
+    )
 
 
 def http_put(url, json_payload=None, headers=None, timeout=120):
-    resp = requests.put(url, json=json_payload, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+    return _request_with_retry(
+        "PUT",
+        url,
+        json=json_payload,
+        headers=headers,
+        timeout=timeout,
+    )
 
 
 # =========================
