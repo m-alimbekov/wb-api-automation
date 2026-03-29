@@ -3,7 +3,9 @@ import json
 import os
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import requests
@@ -13,8 +15,8 @@ from dotenv import load_dotenv
 # =========================
 # PATHS
 # =========================
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ENV_PATH = PROJECT_ROOT / ".env"
 
 load_dotenv(ENV_PATH)
 
@@ -30,8 +32,23 @@ ZERO_MISSING_IN_XML = os.getenv("ZERO_MISSING_IN_XML", "false").strip().lower() 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
 MIN_SAFE_STOCK = int(os.getenv("MIN_SAFE_STOCK", "2"))
 
+# Universal notifications
+NOTIFY_ENABLED = os.getenv("NOTIFY_ENABLED", "false").strip().lower() == "true"
+NOTIFY_PROVIDER = os.getenv("NOTIFY_PROVIDER", "").strip().lower()
+NOTIFY_TO = os.getenv("NOTIFY_TO", "").strip()
+NOTIFY_FROM_EMAIL = os.getenv("NOTIFY_FROM_EMAIL", "").strip()
+NOTIFY_FROM_NAME = os.getenv("NOTIFY_FROM_NAME", "Automation").strip()
+NOTIFY_SUCCESS_POLICY = os.getenv("NOTIFY_SUCCESS_POLICY", "hourly").strip().lower()
+NOTIFY_SUBJECT_PREFIX = os.getenv("NOTIFY_SUBJECT_PREFIX", "[AUTOMATION]").strip()
+NOTIFY_STATE_FILE_RAW = os.getenv("NOTIFY_STATE_FILE", ".runtime/notify_state.json").strip()
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
+
 if not WB_TOKEN:
     raise ValueError("WB_TOKEN не найден в .env")
+
+NOTIFY_STATE_FILE = Path(NOTIFY_STATE_FILE_RAW)
+if not NOTIFY_STATE_FILE.is_absolute():
+    NOTIFY_STATE_FILE = PROJECT_ROOT / NOTIFY_STATE_FILE
 
 
 # =========================
@@ -363,6 +380,174 @@ def update_wb_stocks(warehouse_id, updates):
 
 
 # =========================
+# NOTIFICATIONS
+# =========================
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def load_notify_state() -> dict:
+    if not NOTIFY_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(NOTIFY_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_notify_state(state: dict) -> None:
+    NOTIFY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    NOTIFY_STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def should_send_success_notification() -> bool:
+    policy = NOTIFY_SUCCESS_POLICY
+
+    if policy == "always":
+        return True
+    if policy == "never":
+        return False
+
+    state = load_notify_state()
+    last_sent_raw = state.get("last_success_sent_at")
+    if not last_sent_raw:
+        return True
+
+    try:
+        last_sent = datetime.fromisoformat(last_sent_raw)
+    except Exception:
+        return True
+
+    now = utc_now()
+
+    if policy == "hourly":
+        return now - last_sent >= timedelta(hours=1)
+    if policy == "daily":
+        return now - last_sent >= timedelta(days=1)
+
+    return True
+
+
+def mark_success_notification_sent() -> None:
+    state = load_notify_state()
+    state["last_success_sent_at"] = utc_now().isoformat()
+    save_notify_state(state)
+
+
+def send_brevo_email(subject: str, text_body: str) -> None:
+    if not BREVO_API_KEY:
+        raise RuntimeError("BREVO_API_KEY не найден в .env")
+    if not NOTIFY_TO:
+        raise RuntimeError("NOTIFY_TO не найден в .env")
+    if not NOTIFY_FROM_EMAIL:
+        raise RuntimeError("NOTIFY_FROM_EMAIL не найден в .env")
+
+    url = "https://api.brevo.com/v3/smtp/email"
+
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+    }
+
+    payload = {
+        "sender": {
+            "email": NOTIFY_FROM_EMAIL,
+            "name": NOTIFY_FROM_NAME or "Automation",
+        },
+        "to": [{"email": NOTIFY_TO}],
+        "subject": subject,
+        "textContent": text_body[:10000],
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Brevo API error {resp.status_code}: {resp.text}")
+
+
+def send_notification(subject: str, body: str) -> None:
+    if not NOTIFY_ENABLED:
+        print("Уведомления отключены: NOTIFY_ENABLED=false")
+        return
+
+    provider = NOTIFY_PROVIDER
+    if provider != "brevo":
+        print(f"Провайдер уведомлений не поддерживается: {provider!r}")
+        return
+
+    send_brevo_email(subject=subject, text_body=body)
+    print("Уведомление отправлено")
+
+
+def build_summary_message(
+    changes: List[dict],
+    updates_count: int,
+    missing_in_wb_count: int,
+    missing_in_xml_count: int,
+    warehouse_name: str,
+    dry_run: bool,
+) -> str:
+    hidden = [x for x in changes if x["change_type"] == "hidden"]
+    decreased = [x for x in changes if x["change_type"] == "decreased"]
+    increased = [x for x in changes if x["change_type"] == "increased"]
+    unchanged = [x for x in changes if x["change_type"] == "unchanged"]
+    zeroed_missing = [x for x in changes if x["change_type"] == "zeroed_missing_in_xml"]
+
+    lines = [
+        "Обновление остатков: успешно",
+        "",
+        f"Склад: {warehouse_name}",
+        f"Dry run: {dry_run}",
+        f"К обновлению: {updates_count}",
+        f"Скрыли из-за малого остатка: {len(hidden)}",
+        f"Уменьшили: {len(decreased)}",
+        f"Увеличили: {len(increased)}",
+        f"Без изменений: {len(unchanged)}",
+        f"Обнулили из-за отсутствия в XML: {len(zeroed_missing)}",
+        f"Есть в XML, но нет в WB: {missing_in_wb_count}",
+        f"Есть в WB, но нет в XML: {missing_in_xml_count}",
+        "",
+        f"MIN_SAFE_STOCK={MIN_SAFE_STOCK}",
+        f"ZERO_MISSING_IN_XML={ZERO_MISSING_IN_XML}",
+        f"SUCCESS_POLICY={NOTIFY_SUCCESS_POLICY}",
+    ]
+
+    examples = hidden[:5] + zeroed_missing[:5]
+    if examples:
+        lines.append("")
+        lines.append("Примеры:")
+        for x in examples:
+            if x["change_type"] == "zeroed_missing_in_xml":
+                lines.append(f'- {x["vendorCode"]}: нет в XML -> 0')
+            else:
+                lines.append(f'- {x["vendorCode"]}: {x["raw_stock"]} -> {x["wb_amount"]}')
+
+    return "\n".join(lines)
+
+
+def build_error_message(error_text: str) -> str:
+    return "\n".join(
+        [
+            "Обновление остатков: ОШИБКА",
+            "",
+            error_text,
+        ]
+    )
+
+
+def success_subject() -> str:
+    return f"{NOTIFY_SUBJECT_PREFIX} Успех: update_stocks.py"
+
+
+def error_subject() -> str:
+    return f"{NOTIFY_SUBJECT_PREFIX} Ошибка: update_stocks.py"
+
+
+# =========================
 # MAIN
 # =========================
 def main():
@@ -410,12 +595,27 @@ def main():
 
     print_changes_report(changes)
 
+    summary_text = build_summary_message(
+        changes=changes,
+        updates_count=len(updates),
+        missing_in_wb_count=len(missing_in_wb),
+        missing_in_xml_count=len(missing_in_xml),
+        warehouse_name=TARGET_WAREHOUSE_NAME,
+        dry_run=STOCKS_DRY_RUN,
+    )
+
     if not updates:
         print("\nНечего обновлять.")
+        if should_send_success_notification():
+            send_notification(success_subject(), summary_text + "\n\nНечего обновлять.")
+            mark_success_notification_sent()
         return
 
     if STOCKS_DRY_RUN:
         print("\nSTOCKS_DRY_RUN=True, запись в WB не выполняется.")
+        if should_send_success_notification():
+            send_notification(success_subject(), summary_text + "\n\nЗапись в WB не выполнялась.")
+            mark_success_notification_sent()
         return
 
     print("\n6. update...")
@@ -423,6 +623,19 @@ def main():
 
     print("\nГОТОВО")
 
+    if should_send_success_notification():
+        send_notification(success_subject(), summary_text)
+        mark_success_notification_sent()
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        error_text = str(e)
+        print(f"\nERROR: {error_text}")
+        try:
+            send_notification(error_subject(), build_error_message(error_text))
+        except Exception as notify_error:
+            print(f"Не удалось отправить уведомление об ошибке: {notify_error}")
+        raise
